@@ -1,4 +1,4 @@
-// Story.jsx (v2 FINAL, Step 34) — root component of every video: wires intro → scenes → outro, camera, FX, captions, audio.
+// Story.jsx (v3, Step P2.10 — v2 FINAL from Step 34 + the 5 Part 2 scenes) — root component of every video: wires intro → scenes → outro, camera, FX, captions, audio.
 // Exports : Story (named + default), totalFramesFor(data, intro, outro), locate(data, narrationFrame)   [same API as v1]
 //           + pure helpers (testable): SCENES, sceneComponent(name), boundaryKind(i, n), dipFrames(len, i, n),
 //             ambienceVolume(f, o), speechSpan(data, introOffset), DUCK, BASE_VOL
@@ -6,7 +6,7 @@
 //             debug -> small HUD in the top safe margin (frame, time, scene, page, word). Final renders: false.
 //             intro/outro -> include the 60/90-frame segments (they only shift the timeline; story_data.json is built to match).
 // Needs   : story_data.json (build_data.py) · narration.wav (the Action copies <part>.wav to it) · ambience.wav (make_ambience.py)
-//           · Intro, Outro, Captions, Camera, Fx_Film, Fx_Particles, Transitions, Scene01..04, theme.js
+//           · Intro, Outro, Captions, Camera, Fx_Film, Fx_Particles, Transitions, Scene01..04, Part2_Scene01..05, theme.js
 // Used by : Root.jsx.
 // Timeline (frames):  [ intro? ][ narration = data.narrationFrames: scenes + captions ][ outro? ]
 //   Frames in story_data.json are RELATIVE to narration start → everything narration-related sits inside ONE
@@ -35,10 +35,18 @@ import Scene01_Year from './Scene01_Year.jsx';
 import Scene02_Village from './Scene02_Village.jsx';
 import Scene03_Family from './Scene03_Family.jsx';
 import Scene04_Ages from './Scene04_Ages.jsx';
+import Part2_Scene01_Marriage from './Part2_Scene01_Marriage.jsx';
+import Part2_Scene02_Joint from './Part2_Scene02_Joint.jsx';
+import Part2_Scene03_Discord from './Part2_Scene03_Discord.jsx';
+import Part2_Scene04_Leave from './Part2_Scene04_Leave.jsx';
+import Part2_Scene05_Land from './Part2_Scene05_Land.jsx';
 
 // ---------- scene registry: `scene.component` (story_data.json) → React component ----------
 // Future parts: import the new Part2_SceneNN_*.jsx above and add one line here (nothing else changes).
-export const SCENES = {Scene01_Year, Scene02_Village, Scene03_Family, Scene04_Ages};
+export const SCENES = {
+  Scene01_Year, Scene02_Village, Scene03_Family, Scene04_Ages, // horror1
+  Part2_Scene01_Marriage, Part2_Scene02_Joint, Part2_Scene03_Discord, Part2_Scene04_Leave, Part2_Scene05_Land, // horror2
+};
 export const sceneComponent = (name) => (Object.prototype.hasOwnProperty.call(SCENES, name) ? SCENES[name] : null);
 
 // ---------- pure helpers (no React; easy to test) ----------

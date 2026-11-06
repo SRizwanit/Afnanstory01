@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build_data.py  (Step 5)  --  stdlib only
+"""build_data.py  (Step 5; Step P2.2 added the horror2 scene table)  --  stdlib only
 
 Purpose : <part>.json (word timings) + <part>.wav  ->  story_data.json (schema: 2dpython.md 6.2)
 Usage   : python3 build_data.py --part horror1 [--sync keep|fit|offset:-0.2]
@@ -37,6 +37,14 @@ PARTS = {
         {"id": "village", "component": "Scene02_Village", "title": "লাহুরিয়া গ্রাম", "range": (5, 13)},
         {"id": "family", "component": "Scene03_Family", "title": "বিশ্বাস পরিবার", "range": (14, 26)},
         {"id": "ages", "component": "Scene04_Ages", "title": "বয়স", "range": (27, 33)},
+    ],
+    # Part 2 (Step P2.2): 47 words; scene plan = 2dpython.md 2.7 (titles are labels for the debug HUD only)
+    "horror2": [
+        {"id": "marriage", "component": "Part2_Scene01_Marriage", "title": "বিয়ে", "range": (0, 7)},
+        {"id": "joint", "component": "Part2_Scene02_Joint", "title": "একান্নবর্তী পরিবার", "range": (8, 11)},
+        {"id": "discord", "component": "Part2_Scene03_Discord", "title": "বনিবনা হয়নি", "range": (12, 26)},
+        {"id": "leave", "component": "Part2_Scene04_Leave", "title": "বাড়ি ছেড়ে", "range": (27, 35)},
+        {"id": "land", "component": "Part2_Scene05_Land", "title": "পতিত জমি", "range": (36, 46)},
     ],
 }
 
