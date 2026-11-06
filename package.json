@@ -1,0 +1,32 @@
+{
+  "name": "horror-2d-animation",
+  "version": "1.0.0",
+  "description": "Bengali horror story 2D animation - Python + Remotion + GitHub Actions (flat repo, no sub-folders)",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "remotion studio index.js",
+    "render": "remotion render index.js",
+    "still": "remotion still index.js",
+    "compositions": "remotion compositions index.js",
+    "data": "python3 build_data.py --part horror1",
+    "ambience": "python3 make_ambience.py --part horror1",
+    "render:vertical": "remotion render index.js Vertical out-vertical-hd.mp4",
+    "render:horizontal": "remotion render index.js Horizontal out-horizontal-hd.mp4",
+    "render:vertical4k": "remotion render index.js Vertical out-vertical-4k.mp4 --scale=2",
+    "render:horizontal4k": "remotion render index.js Horizontal out-horizontal-4k.mp4 --scale=2"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.541",
+    "@remotion/google-fonts": "4.0.541",
+    "@remotion/noise": "4.0.541",
+    "@remotion/paths": "4.0.541",
+    "@remotion/shapes": "4.0.541",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.541"
+  }
+}
