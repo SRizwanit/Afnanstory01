@@ -1,0 +1,775 @@
+# render_merge.yml (Step 39) - manual GitHub Action: render part 1, THEN part 2, THEN merge both videos into one MP4.
+# Trigger : workflow_dispatch only (Actions -> "Render and merge" -> Run workflow, from the GitHub mobile website).
+# Inputs  : part_first (default horror1), part_second (default horror2), orientation, quality, mode (video|draft), sync_mode,
+#           intro_first / outro_first / intro_second / outro_second, join (cut|crossfade), xfade_seconds, publish_release.
+# Jobs    : prepare (validate + unpack update.zip + preflight for BOTH parts + render matrix)
+#           -> render_first  (part 1, one runner per output, parallel across orientation/quality, retries)
+#           -> render_second (starts only AFTER render_first succeeded: part 2, same matrix)
+#           -> merge         (one runner per output: ffprobe checks, ffmpeg concat/crossfade, duration check)
+#           -> release (optional) -> summary (table in the job summary, runs even after failures).
+# Output  : artifacts "<part_first>-<label>" and "<part_second>-<label>" (the single parts, 14 days),
+#           "merged-<part_first>-<part_second>-<label>" (the final merged MP4, 30 days),
+#           optional Release "merge-<part_first>-<part_second>-<run>".
+#           Merged file name: <part_first>-<part_second>-<label>.mp4   (label = vertical-hd, horizontal-4k, vertical-draft ...)
+# Needs   : package.json, index.js, Root.jsx, Story.jsx, theme.js, build_data.py, <part>.wav, <part>.json for BOTH parts
+#           (make_ambience.py is optional). Repo stays flat: out/, first/, second/ exist only on the runners.
+# Time    : no timeout-minutes is set on any job (no self-imposed time limit). GitHub itself still stops a single job at
+#           360 minutes (6 h); every output renders on its own runner, so one job only has to render ONE video.
+# Joining : join=cut        -> ffmpeg concat with stream copy (no re-encode, lossless, fast). If the streams differ or the
+#                              result length is wrong, it automatically falls back to a re-encode concat.
+#           join=crossfade  -> re-encode with a video cross-dissolve + audio cross-fade of xfade_seconds (0.1 - 3).
+# Defaults: part 1 keeps its intro and drops its outro; part 2 drops its intro and keeps its outro, so the merged video
+#           has ONE intro (start) and ONE outro (end). Change the four intro/outro switches if you want otherwise.
+# Notes   : GITHUB_TOKEN may not change workflow files, so update.zip is unpacked with -x ".github/*";
+#           to change THIS file, paste it by hand in the GitHub mobile website (.github/workflows/render_merge.yml).
+#           Text inputs are passed through env vars, never pasted into shell code.
+#           Both parts must have the same render options (orientation, quality, sync) - the workflow guarantees it.
+name: Render and merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      part_first:
+        description: "First part (plays first; uses <part>.wav and <part>.json)"
+        type: string
+        default: "horror1"
+      part_second:
+        description: "Second part (rendered after the first, appended at the end)"
+        type: string
+        default: "horror2"
+      orientation:
+        description: "Which orientation"
+        type: choice
+        options: [both, vertical, horizontal]
+        default: both
+      quality:
+        description: "hd = 1080p, 4k = 2x (video mode only; draft is always small)"
+        type: choice
+        options: [hd, 4k, both]
+        default: hd
+      mode:
+        description: "video = final quality, draft = small+fast preview (debug HUD on) - use draft to test the merge first"
+        type: choice
+        options: [video, draft]
+        default: draft
+      sync_mode:
+        description: "Caption sync for both parts: keep | fit | offset:-0.2"
+        type: string
+        default: "keep"
+      intro_first:
+        description: "Part 1: include intro (60 frames)"
+        type: boolean
+        default: true
+      outro_first:
+        description: "Part 1: include outro (90 frames)"
+        type: boolean
+        default: false
+      intro_second:
+        description: "Part 2: include intro (60 frames)"
+        type: boolean
+        default: false
+      outro_second:
+        description: "Part 2: include outro (90 frames)"
+        type: boolean
+        default: true
+      join:
+        description: "cut = plain join (lossless) | crossfade = soft dissolve between the parts (re-encodes)"
+        type: choice
+        options: [cut, crossfade]
+        default: cut
+      xfade_seconds:
+        description: "Crossfade length in seconds (only for join=crossfade; 0.1 - 3)"
+        type: string
+        default: "0.5"
+      publish_release:
+        description: "Also attach the merged files to a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: "1"
+  FORCE_COLOR: "0"
+
+jobs:
+  # ------------------------------------------------------------------ 1) prepare
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      labels: ${{ steps.plan.outputs.labels }}
+    env:
+      PART_A: ${{ inputs.part_first }}
+      PART_B: ${{ inputs.part_second }}
+      SYNC: ${{ inputs.sync_mode }}
+      ORIENTATION: ${{ inputs.orientation }}
+      QUALITY: ${{ inputs.quality }}
+      MODE: ${{ inputs.mode }}
+      JOIN: ${{ inputs.join }}
+      XFADE: ${{ inputs.xfade_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          for P in "$PART_A" "$PART_B"; do
+            [[ "$P" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::part names may only contain letters, digits, _ and - (got: $P)"; exit 1; }
+          done
+          [ "$PART_A" != "$PART_B" ] || { echo "::error::part_first and part_second must be different parts"; exit 1; }
+          [[ "$SYNC" =~ ^(keep|fit|offset:-?[0-9]+(\.[0-9]+)?)$ ]] || { echo "::error::sync_mode must be keep, fit or offset:-0.2"; exit 1; }
+          if [ "$JOIN" = "crossfade" ]; then
+            python3 - <<'PY'
+          import os, sys
+          try:
+              v = float(os.environ["XFADE"])
+          except ValueError:
+              print("::error::xfade_seconds must be a number like 0.5")
+              sys.exit(1)
+          if not 0.1 <= v <= 3:
+              print("::error::xfade_seconds must be between 0.1 and 3")
+              sys.exit(1)
+          PY
+          fi
+          echo "Inputs OK: first=$PART_A second=$PART_B mode=$MODE orientation=$ORIENTATION quality=$QUALITY sync=$SYNC join=$JOIN"
+
+      - name: Unpack update.zip (if present)
+        run: |
+          set -euo pipefail
+          if [ -f update.zip ]; then
+            echo "update.zip found - unpacking (workflow files excluded)"
+            unzip -o -q update.zip -x ".github/*"
+            rm -f update.zip
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No changes after unpack."
+            else
+              git commit -m "Unpack update.zip (merge run ${{ github.run_number }})"
+              git push origin HEAD
+            fi
+          else
+            echo "No update.zip - using files already in the repo."
+          fi
+
+      - name: Preflight - required files exist (both parts)
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in package.json index.js Root.jsx Story.jsx theme.js build_data.py "$PART_A.wav" "$PART_A.json" "$PART_B.wav" "$PART_B.json"; do
+            if [ -f "$f" ]; then echo "ok       $f"; else echo "::error::missing file: $f (upload it with update.zip)"; missing=1; fi
+          done
+          [ -f make_ambience.py ] && echo "ok       make_ambience.py" || echo "::notice::make_ambience.py not found - ambience step will be skipped"
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Plan render matrix
+        id: plan
+        run: |
+          python3 - <<'PY'
+          import json, os
+          orient = os.environ["ORIENTATION"]
+          quality = os.environ["QUALITY"]
+          mode = os.environ["MODE"]
+          orients = ["vertical", "horizontal"] if orient == "both" else [orient]
+          comps = {"vertical": "Vertical", "horizontal": "Horizontal"}
+          items = []
+          for o in orients:
+              if mode == "video":
+                  qs = ["hd", "4k"] if quality == "both" else [quality]
+                  for q in qs:
+                      items.append({"label": f"{o}-{q}", "comp": comps[o], "scale": "2" if q == "4k" else "1",
+                                    "kind": "video", "debug": "false", "crf": "18", "preset": "medium"})
+              else:
+                  items.append({"label": f"{o}-draft", "comp": comps[o], "scale": "0.5",
+                                "kind": "draft", "debug": "true", "crf": "28", "preset": "ultrafast"})
+          matrix = json.dumps({"include": items}, separators=(",", ":"))
+          labels = ",".join(i["label"] for i in items)
+          print(matrix)
+          print("labels:", labels)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={matrix}\n")
+              fh.write(f"labels={labels}\n")
+          PY
+
+  # ------------------------------------------------------------------ 2) render PART 1 (one runner per output)
+  render_first:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PART: ${{ inputs.part_first }}
+      SYNC: ${{ inputs.sync_mode }}
+      INTRO: ${{ inputs.intro_first }}
+      OUTRO: ${{ inputs.outro_first }}
+      LABEL: ${{ matrix.label }}
+      COMP: ${{ matrix.comp }}
+      SCALE: ${{ matrix.scale }}
+      KIND: ${{ matrix.kind }}
+      DEBUG: ${{ matrix.debug }}
+    steps:
+      # ref = branch name, so the files pushed by the "prepare" job (unpacked update.zip) are included
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build data and audio (Python)
+        run: |
+          set -euo pipefail
+          INTRO_F=60; [ "$INTRO" = "true" ] || INTRO_F=0
+          OUTRO_F=90; [ "$OUTRO" = "true" ] || OUTRO_F=0
+          echo "::group::build_data.py (part=$PART intro=$INTRO_F outro=$OUTRO_F sync=$SYNC)"
+          python build_data.py --part "$PART" --sync "$SYNC" --intro "$INTRO_F" --outro "$OUTRO_F"
+          echo "::endgroup::"
+          if [ -f make_ambience.py ]; then
+            echo "::group::make_ambience.py"
+            python -m pip install --quiet numpy || true
+            python make_ambience.py --part "$PART"
+            echo "::endgroup::"
+          else
+            echo "make_ambience.py does not exist yet - skipped"
+          fi
+          # fixed name used by Story v2 (Step 34)
+          cp "$PART.wav" narration.wav
+
+      - name: Install Chrome Headless Shell libraries (Ubuntu 24.04)
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y \
+                libnss3 libdbus-1-3 libatk1.0-0 libasound2t64 libxrandr2 libxkbcommon-dev \
+                libxfixes3 libxcomposite1 libxdamage1 libgbm-dev libcups2 libcairo2 \
+                libpango-1.0-0 libatk-bridge2.0-0; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $attempt failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
+
+      - name: npm install + Chrome (3 attempts)
+        run: |
+          set -uo pipefail
+          retry() {
+            local n=1 max=3 delay=15 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::failed after $n attempts: $*"; return "$rc"; fi
+              echo "::warning::attempt $n failed (exit $rc) - retrying in ${delay}s: $*"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+          retry npm install --no-audit --no-fund || exit 1
+          retry npx remotion browser ensure || exit 1
+
+      - name: Render part 1
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          START=$SECONDS
+          PROPS=$(python3 - <<'PY'
+          import json, os
+          e = os.environ
+          p = {"part": e["PART"], "debug": e["DEBUG"] == "true",
+               "intro": e["INTRO"] == "true", "outro": e["OUTRO"] == "true"}
+          print(json.dumps(p, ensure_ascii=False, separators=(",", ":")))
+          PY
+          )
+          echo "part: $PART   composition: $COMP   kind: $KIND   scale: $SCALE"
+          echo "props: $PROPS"
+
+          retry() {
+            local n=1 max=3 delay=20 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::render failed after $n attempts: $COMP ($PART $LABEL)"; return "$rc"; fi
+              echo "::warning::render attempt $n failed (exit $rc) - retrying in ${delay}s"
+              [ -n "${RETRY_CLEAN:-}" ] && rm -f "$RETRY_CLEAN"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+
+          case "$KIND" in
+            video)
+              echo "::group::remotion render $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=18 --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            draft)
+              echo "::group::remotion render (draft) $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=28 --x264-preset=ultrafast --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            *)
+              echo "::error::unknown kind $KIND"; exit 1
+              ;;
+          esac
+
+          ELAPSED=$((SECONDS - START))
+          ls -lh out
+          {
+            echo "### Part 1 \`$PART\` - \`$LABEL\` ($COMP, scale $SCALE) - ${ELAPSED}s"
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.part_first }}-${{ matrix.label }}
+          path: out/*
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ 3) render PART 2 (only after part 1 succeeded)
+  render_second:
+    needs: [prepare, render_first]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PART: ${{ inputs.part_second }}
+      SYNC: ${{ inputs.sync_mode }}
+      INTRO: ${{ inputs.intro_second }}
+      OUTRO: ${{ inputs.outro_second }}
+      LABEL: ${{ matrix.label }}
+      COMP: ${{ matrix.comp }}
+      SCALE: ${{ matrix.scale }}
+      KIND: ${{ matrix.kind }}
+      DEBUG: ${{ matrix.debug }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build data and audio (Python)
+        run: |
+          set -euo pipefail
+          INTRO_F=60; [ "$INTRO" = "true" ] || INTRO_F=0
+          OUTRO_F=90; [ "$OUTRO" = "true" ] || OUTRO_F=0
+          echo "::group::build_data.py (part=$PART intro=$INTRO_F outro=$OUTRO_F sync=$SYNC)"
+          python build_data.py --part "$PART" --sync "$SYNC" --intro "$INTRO_F" --outro "$OUTRO_F"
+          echo "::endgroup::"
+          if [ -f make_ambience.py ]; then
+            echo "::group::make_ambience.py"
+            python -m pip install --quiet numpy || true
+            python make_ambience.py --part "$PART"
+            echo "::endgroup::"
+          else
+            echo "make_ambience.py does not exist yet - skipped"
+          fi
+          cp "$PART.wav" narration.wav
+
+      - name: Install Chrome Headless Shell libraries (Ubuntu 24.04)
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y \
+                libnss3 libdbus-1-3 libatk1.0-0 libasound2t64 libxrandr2 libxkbcommon-dev \
+                libxfixes3 libxcomposite1 libxdamage1 libgbm-dev libcups2 libcairo2 \
+                libpango-1.0-0 libatk-bridge2.0-0; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $attempt failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
+
+      - name: npm install + Chrome (3 attempts)
+        run: |
+          set -uo pipefail
+          retry() {
+            local n=1 max=3 delay=15 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::failed after $n attempts: $*"; return "$rc"; fi
+              echo "::warning::attempt $n failed (exit $rc) - retrying in ${delay}s: $*"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+          retry npm install --no-audit --no-fund || exit 1
+          retry npx remotion browser ensure || exit 1
+
+      - name: Render part 2
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          START=$SECONDS
+          PROPS=$(python3 - <<'PY'
+          import json, os
+          e = os.environ
+          p = {"part": e["PART"], "debug": e["DEBUG"] == "true",
+               "intro": e["INTRO"] == "true", "outro": e["OUTRO"] == "true"}
+          print(json.dumps(p, ensure_ascii=False, separators=(",", ":")))
+          PY
+          )
+          echo "part: $PART   composition: $COMP   kind: $KIND   scale: $SCALE"
+          echo "props: $PROPS"
+
+          retry() {
+            local n=1 max=3 delay=20 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::render failed after $n attempts: $COMP ($PART $LABEL)"; return "$rc"; fi
+              echo "::warning::render attempt $n failed (exit $rc) - retrying in ${delay}s"
+              [ -n "${RETRY_CLEAN:-}" ] && rm -f "$RETRY_CLEAN"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+
+          case "$KIND" in
+            video)
+              echo "::group::remotion render $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=18 --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            draft)
+              echo "::group::remotion render (draft) $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=28 --x264-preset=ultrafast --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            *)
+              echo "::error::unknown kind $KIND"; exit 1
+              ;;
+          esac
+
+          ELAPSED=$((SECONDS - START))
+          ls -lh out
+          {
+            echo "### Part 2 \`$PART\` - \`$LABEL\` ($COMP, scale $SCALE) - ${ELAPSED}s"
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.part_second }}-${{ matrix.label }}
+          path: out/*
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ 4) merge (part 1 + part 2 -> one MP4), one runner per output
+  merge:
+    needs: [prepare, render_first, render_second]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PART_A: ${{ inputs.part_first }}
+      PART_B: ${{ inputs.part_second }}
+      LABEL: ${{ matrix.label }}
+      CRF: ${{ matrix.crf }}
+      PRESET: ${{ matrix.preset }}
+      JOIN: ${{ inputs.join }}
+      XFADE: ${{ inputs.xfade_seconds }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.part_first }}-${{ matrix.label }}
+          path: first
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.part_second }}-${{ matrix.label }}
+          path: second
+
+      - name: Make sure ffmpeg is installed
+        run: |
+          set -uo pipefail
+          if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+            ffmpeg -version | head -1
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y ffmpeg; then exit 0; fi
+            echo "::warning::apt attempt $attempt failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not install ffmpeg"
+          exit 1
+
+      - name: Merge part 1 + part 2
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          A="first/${PART_A}-${LABEL}.mp4"
+          B="second/${PART_B}-${LABEL}.mp4"
+          OUT="out/${PART_A}-${PART_B}-${LABEL}.mp4"
+          START=$SECONDS
+
+          for f in "$A" "$B"; do
+            [ -s "$f" ] || { echo "::error::missing or empty input video: $f"; ls -R first second; exit 1; }
+          done
+
+          vsig() { ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate,pix_fmt -of csv=p=0 "$1"; }
+          asig() { ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 "$1"; }
+          dur()  { ffprobe -v error -show_entries format=duration -of csv=p=0 "$1"; }
+
+          VA=$(vsig "$A"); VB=$(vsig "$B"); AA=$(asig "$A"); AB=$(asig "$B")
+          D1=$(dur "$A"); D2=$(dur "$B")
+          echo "part 1: video=$VA audio=$AA duration=${D1}s"
+          echo "part 2: video=$VB audio=$AB duration=${D2}s"
+          [ -n "$AA" ] && [ -n "$AB" ] || { echo "::error::an input has no audio stream (part 1: '$AA', part 2: '$AB')"; exit 1; }
+
+          # video size / frame rate must match (same composition + scale -> they always do)
+          if [ "$(echo "$VA" | cut -d, -f2,3,4)" != "$(echo "$VB" | cut -d, -f2,3,4)" ]; then
+            echo "::error::the two videos have different size or frame rate: '$VA' vs '$VB'"; exit 1
+          fi
+
+          ENC=(-c:v libx264 -crf "$CRF" -preset "$PRESET" -pix_fmt yuv420p -c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart)
+
+          reencode_concat() {
+            echo "re-encode concat (filter)"
+            ffmpeg -y -hide_banner -loglevel warning -i "$A" -i "$B" \
+              -filter_complex "[0:v]setsar=1[v0];[1:v]setsar=1[v1];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]" \
+              -map "[v]" -map "[a]" "${ENC[@]}" "$OUT"
+          }
+
+          METHOD=""
+          if [ "$JOIN" = "crossfade" ]; then
+            OFF=$(python3 -c "print(round(float('$D1') - float('$XFADE'), 3))")
+            echo "crossfade ${XFADE}s, second video starts at ${OFF}s of the first"
+            if ffmpeg -y -hide_banner -loglevel warning -i "$A" -i "$B" \
+                -filter_complex "[0:v]setsar=1[v0];[1:v]setsar=1[v1];[v0][v1]xfade=transition=fade:duration=${XFADE}:offset=${OFF}[v];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[a0][a1]acrossfade=d=${XFADE}[a]" \
+                -map "[v]" -map "[a]" "${ENC[@]}" "$OUT"; then
+              METHOD="crossfade (re-encode, ${XFADE}s)"
+            else
+              echo "::warning::crossfade failed - falling back to a plain re-encoded cut"
+              rm -f "$OUT"
+              reencode_concat || { echo "::error::ffmpeg failed"; exit 1; }
+              METHOD="cut (re-encode fallback after crossfade failure)"
+            fi
+            EXPECT=$(python3 -c "print(round(float('$D1') + float('$D2') - float('$XFADE'), 3))")
+            [ "$METHOD" = "${METHOD#cut}" ] || EXPECT=$(python3 -c "print(round(float('$D1') + float('$D2'), 3))")
+          else
+            EXPECT=$(python3 -c "print(round(float('$D1') + float('$D2'), 3))")
+            if [ "$VA" = "$VB" ] && [ "$AA" = "$AB" ]; then
+              printf "file '%s'\nfile '%s'\n" "$PWD/$A" "$PWD/$B" > list.txt
+              echo "stream-copy concat (same codecs): video copied, only the tiny audio track is re-encoded to avoid a click at the join"
+              if ffmpeg -y -hide_banner -loglevel warning -f concat -safe 0 -i list.txt -c:v copy -c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart "$OUT"; then
+                GOT=$(dur "$OUT")
+                if python3 -c "import sys; sys.exit(0 if abs(float('$GOT') - float('$EXPECT')) <= 0.35 else 1)"; then
+                  METHOD="cut (video stream copy - lossless, audio re-encoded)"
+                else
+                  echo "::warning::copy result is ${GOT}s but ${EXPECT}s was expected - re-encoding instead"
+                fi
+              else
+                echo "::warning::stream-copy concat failed - re-encoding instead"
+              fi
+              rm -f list.txt
+            else
+              echo "::notice::stream parameters differ ('$VA|$AA' vs '$VB|$AB') - re-encoding"
+            fi
+            if [ -z "$METHOD" ]; then
+              rm -f "$OUT"
+              reencode_concat || { echo "::error::ffmpeg failed"; exit 1; }
+              METHOD="cut (re-encode)"
+            fi
+          fi
+
+          # final check: file exists, has video + audio, length is right (+-0.5 s)
+          [ -s "$OUT" ] || { echo "::error::merged file is missing or empty"; exit 1; }
+          GOT=$(dur "$OUT"); VF=$(vsig "$OUT"); AF=$(asig "$OUT")
+          echo "merged: video=$VF audio=$AF duration=${GOT}s (expected ~${EXPECT}s) via $METHOD"
+          [ -n "$AF" ] || { echo "::error::merged file has no audio"; exit 1; }
+          python3 -c "import sys; sys.exit(0 if abs(float('$GOT') - float('$EXPECT')) <= 0.5 else 1)" \
+            || { echo "::error::merged length ${GOT}s does not match the expected ${EXPECT}s"; exit 1; }
+
+          ELAPSED=$((SECONDS - START))
+          ls -lh out
+          {
+            echo "### Merge \`$LABEL\` - ${ELAPSED}s"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Method | $METHOD |"
+            echo "| Part 1 (\`$PART_A\`) | ${D1}s |"
+            echo "| Part 2 (\`$PART_B\`) | ${D2}s |"
+            echo "| Merged | ${GOT}s |"
+            echo "| File | \`$(basename "$OUT")\` ($(du -h "$OUT" | cut -f1)) |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: merged-${{ inputs.part_first }}-${{ inputs.part_second }}-${{ matrix.label }}
+          path: out/*
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ 5) optional GitHub Release (merged files only)
+  release:
+    needs: [prepare, merge]
+    if: ${{ inputs.publish_release && needs.merge.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.rel.outputs.url }}
+    env:
+      PART_A: ${{ inputs.part_first }}
+      PART_B: ${{ inputs.part_second }}
+      MODE: ${{ inputs.mode }}
+      JOIN: ${{ inputs.join }}
+      RUN: ${{ github.run_number }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: merged-*
+          path: out
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated merge of \`$PART_A\` + \`$PART_B\` (mode \`$MODE\`, join \`$JOIN\`, run #$RUN)."
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+          } > release_notes.md
+          cat release_notes.md
+
+      - uses: softprops/action-gh-release@v2
+        id: rel
+        with:
+          tag_name: merge-${{ inputs.part_first }}-${{ inputs.part_second }}-${{ github.run_number }}
+          name: ${{ inputs.part_first }} + ${{ inputs.part_second }} ${{ inputs.mode }} #${{ github.run_number }}
+          target_commitish: ${{ github.ref_name }}
+          body_path: release_notes.md
+          prerelease: ${{ inputs.mode == 'draft' }}
+          files: out/*
+
+  # ------------------------------------------------------------------ 6) summary (runs even if something failed)
+  summary:
+    needs: [prepare, render_first, render_second, merge, release]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      PART_A: ${{ inputs.part_first }}
+      PART_B: ${{ inputs.part_second }}
+      MODE: ${{ inputs.mode }}
+      ORIENTATION: ${{ inputs.orientation }}
+      QUALITY: ${{ inputs.quality }}
+      SYNC: ${{ inputs.sync_mode }}
+      JOIN: ${{ inputs.join }}
+      XFADE: ${{ inputs.xfade_seconds }}
+      INTRO_A: ${{ inputs.intro_first }}
+      OUTRO_A: ${{ inputs.outro_first }}
+      INTRO_B: ${{ inputs.intro_second }}
+      OUTRO_B: ${{ inputs.outro_second }}
+      LABELS: ${{ needs.prepare.outputs.labels }}
+      FIRST_RESULT: ${{ needs.render_first.result }}
+      SECOND_RESULT: ${{ needs.render_second.result }}
+      MERGE_RESULT: ${{ needs.merge.result }}
+      RELEASE_RESULT: ${{ needs.release.result }}
+      RELEASE_URL: ${{ needs.release.outputs.url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dl
+
+      - name: Job summary table
+        run: |
+          python3 - <<'PY'
+          import os
+          e = os.environ
+          labels = [x for x in e.get("LABELS", "").split(",") if x]
+          a, b = e["PART_A"], e["PART_B"]
+
+          def info(name):
+              d = os.path.join("dl", name)
+              files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+              size = sum(os.path.getsize(os.path.join(d, f)) for f in files)
+              return len(files), size
+
+          def cell(name):
+              n, size = info(name)
+              return f"OK ({size / 1048576:.1f} MB)" if n else "MISSING"
+
+          rows, ok = [], 0
+          for lb in labels:
+              m = cell(f"merged-{a}-{b}-{lb}")
+              if m.startswith("OK"):
+                  ok += 1
+              rows.append(f"| `{lb}` | {cell(f'{a}-{lb}')} | {cell(f'{b}-{lb}')} | {m} |")
+          out = []
+          out.append(f"## Render and merge summary - `{a}` + `{b}`")
+          out.append("")
+          out.append(f"- Mode: **{e['MODE']}** | orientation: {e['ORIENTATION']} | quality: {e['QUALITY']} | sync: `{e['SYNC']}`")
+          xf = f" ({e['XFADE']} s)" if e["JOIN"] == "crossfade" else ""
+          out.append(f"- Join: **{e['JOIN']}**{xf}")
+          out.append(f"- `{a}`: intro {e['INTRO_A']} / outro {e['OUTRO_A']} | `{b}`: intro {e['INTRO_B']} / outro {e['OUTRO_B']}")
+          out.append(f"- Part 1 render: **{e['FIRST_RESULT']}** | part 2 render: **{e['SECOND_RESULT']}** | merge: **{e['MERGE_RESULT']}** | merged outputs ready: **{ok}/{len(labels)}**")
+          if e.get("RELEASE_RESULT") and e["RELEASE_RESULT"] != "skipped":
+              url = e.get("RELEASE_URL", "")
+              out.append(f"- Release: **{e['RELEASE_RESULT']}**" + (f" - {url}" if url else ""))
+          out.append(f"- Download the files from the **Artifacts** section at the bottom of this run page: {e['RUN_URL']}")
+          out.append(f"- The final file is the artifact named `merged-{a}-{b}-<label>` (file `{a}-{b}-<label>.mp4`).")
+          out.append("")
+          out.append(f"| Output | `{a}` | `{b}` | Merged |")
+          out.append("|---|---|---|---|")
+          out.extend(rows)
+          out.append("")
+          if e["FIRST_RESULT"] != "success":
+              out.append(f"> Part 1 (`{a}`) failed, so part 2 and the merge were skipped. Open the failed render job, copy the red error lines and send them to the AI.")
+          elif e["SECOND_RESULT"] != "success":
+              out.append(f"> Part 2 (`{b}`) failed, so the merge was skipped (the part 1 video is still in Artifacts). Open the failed render job and send the red error lines to the AI.")
+          elif ok < len(labels):
+              out.append("> If a merged cell says MISSING: open that merge job, copy the red error lines and send them to the AI (one file will be fixed).")
+          text = "\n".join(out) + "\n"
+          print(text)
+          with open(e["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(text)
+          PY
