@@ -1,1 +1,482 @@
+# render.yml (Step 37, v2 final) - manual GitHub Action: unpack update.zip -> build data -> render with Remotion -> upload MP4/PNG -> summary.
+# Trigger : workflow_dispatch only (run it from the GitHub mobile website: Actions -> "Render video" -> Run workflow).
+# Inputs  : part, orientation, quality, mode (video|draft|still|thumbnail), still_frames, sync_mode, intro, outro,
+#           thumb_title, thumb_subtitle, publish_release.
+# Jobs    : prepare (validate + unpack update.zip + preflight file check + build the render matrix)
+#           -> render (one runner per output, in parallel, with retries)
+#           -> release (optional GitHub Release, notes file) -> summary (table in the job summary, runs even after failures).
+# Output  : artifacts "<part>-<label>" (MP4 or PNG) kept 14 days; optional Release "render-<part>-<run>".
+#           thumbnail mode -> out/<part>-<orientation>-thumb[-4k].png from the Remotion stills ThumbnailV / ThumbnailH.
+# Needs   : package.json, index.js, Root.jsx, Story.jsx, theme.js, build_data.py, <part>.wav, <part>.json
+#           (make_ambience.py is optional until it exists). Repo stays flat: out/ exists only on the runner.
+# Notes   : GITHUB_TOKEN may not change workflow files, so update.zip is unpacked with -x ".github/*";
+#           to change THIS file, paste it by hand in the GitHub mobile website.
+#           Text inputs (title, subtitle, sync...) are passed through env vars, never pasted into shell code.
+name: Render video
 
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: "Story part (uses <part>.wav and <part>.json)"
+        type: string
+        default: "horror1"
+      orientation:
+        description: "Which orientation"
+        type: choice
+        options: [both, vertical, horizontal]
+        default: both
+      quality:
+        description: "hd = 1080p, 4k = 2x (video and thumbnail modes)"
+        type: choice
+        options: [hd, 4k, both]
+        default: hd
+      mode:
+        description: "video = final, draft = small+fast preview (debug HUD on), still = PNG frames, thumbnail = thumbnail PNG"
+        type: choice
+        options: [video, draft, still, thumbnail]
+        default: draft
+      still_frames:
+        description: "Frames for still mode (comma list)"
+        type: string
+        default: "30,120,300,450,560"
+      sync_mode:
+        description: "Caption sync: keep | fit | offset:-0.2"
+        type: string
+        default: "keep"
+      intro:
+        description: "Include intro (60 frames)"
+        type: boolean
+        default: true
+      outro:
+        description: "Include outro (90 frames)"
+        type: boolean
+        default: true
+      thumb_title:
+        description: "Thumbnail title (thumbnail mode; blank = default title)"
+        type: string
+        default: ""
+      thumb_subtitle:
+        description: "Thumbnail subtitle (thumbnail mode; optional)"
+        type: string
+        default: ""
+      publish_release:
+        description: "Also attach the files to a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: "1"
+  FORCE_COLOR: "0"
+
+jobs:
+  # ------------------------------------------------------------------ 1) prepare
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      labels: ${{ steps.plan.outputs.labels }}
+    env:
+      PART: ${{ inputs.part }}
+      SYNC: ${{ inputs.sync_mode }}
+      FRAMES: ${{ inputs.still_frames }}
+      ORIENTATION: ${{ inputs.orientation }}
+      QUALITY: ${{ inputs.quality }}
+      MODE: ${{ inputs.mode }}
+      THUMB_TITLE: ${{ inputs.thumb_title }}
+      THUMB_SUBTITLE: ${{ inputs.thumb_subtitle }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$PART" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::part may only contain letters, digits, _ and -"; exit 1; }
+          [[ "$SYNC" =~ ^(keep|fit|offset:-?[0-9]+(\.[0-9]+)?)$ ]] || { echo "::error::sync_mode must be keep, fit or offset:-0.2"; exit 1; }
+          [[ "$FRAMES" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]] || { echo "::error::still_frames must look like 30,120,300"; exit 1; }
+          python3 - <<'PY'
+          import os, sys
+          for key in ("THUMB_TITLE", "THUMB_SUBTITLE"):
+              v = os.environ.get(key, "")
+              if len(v) > 80:
+                  print(f"::error::{key.lower()} is too long ({len(v)} chars, max 80)")
+                  sys.exit(1)
+              if any(ord(c) < 32 for c in v):
+                  print(f"::error::{key.lower()} must be one line without control characters")
+                  sys.exit(1)
+              if key == "THUMB_TITLE" and len(v) > 45:
+                  print(f"::warning::thumb_title has {len(v)} chars - the thumbnail font will shrink a lot (best under 45)")
+          PY
+          echo "Inputs OK: part=$PART mode=$MODE orientation=$ORIENTATION quality=$QUALITY sync=$SYNC"
+
+      - name: Unpack update.zip (if present)
+        run: |
+          set -euo pipefail
+          if [ -f update.zip ]; then
+            echo "update.zip found - unpacking (workflow files excluded)"
+            unzip -o -q update.zip -x ".github/*"
+            rm -f update.zip
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No changes after unpack."
+            else
+              git commit -m "Unpack update.zip (run ${{ github.run_number }})"
+              git push origin HEAD
+            fi
+          else
+            echo "No update.zip - using files already in the repo."
+          fi
+
+      - name: Preflight - required files exist
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in package.json index.js Root.jsx Story.jsx theme.js build_data.py "$PART.wav" "$PART.json"; do
+            if [ -f "$f" ]; then echo "ok       $f"; else echo "::error::missing file: $f (upload it with update.zip)"; missing=1; fi
+          done
+          [ -f make_ambience.py ] && echo "ok       make_ambience.py" || echo "::notice::make_ambience.py not found - ambience step will be skipped"
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Plan render matrix
+        id: plan
+        run: |
+          python3 - <<'PY'
+          import json, os
+          orient = os.environ["ORIENTATION"]
+          quality = os.environ["QUALITY"]
+          mode = os.environ["MODE"]
+          orients = ["vertical", "horizontal"] if orient == "both" else [orient]
+          comps = {"vertical": "Vertical", "horizontal": "Horizontal"}
+          thumbs = {"vertical": "ThumbnailV", "horizontal": "ThumbnailH"}
+          items = []
+          for o in orients:
+              if mode == "video":
+                  qs = ["hd", "4k"] if quality == "both" else [quality]
+                  for q in qs:
+                      items.append({"label": f"{o}-{q}", "comp": comps[o], "scale": "2" if q == "4k" else "1",
+                                    "kind": "video", "debug": "false"})
+              elif mode == "draft":
+                  items.append({"label": f"{o}-draft", "comp": comps[o], "scale": "0.5", "kind": "draft", "debug": "true"})
+              elif mode == "thumbnail":
+                  qs = ["hd", "4k"] if quality == "both" else [quality]
+                  for q in qs:
+                      items.append({"label": f"{o}-thumb" + ("-4k" if q == "4k" else ""), "comp": thumbs[o],
+                                    "scale": "2" if q == "4k" else "1", "kind": "thumb", "debug": "false"})
+              else:
+                  items.append({"label": f"{o}-still", "comp": comps[o], "scale": "1", "kind": "still", "debug": "true"})
+          matrix = json.dumps({"include": items}, separators=(",", ":"))
+          labels = ",".join(i["label"] for i in items)
+          print(matrix)
+          print("labels:", labels)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={matrix}\n")
+              fh.write(f"labels={labels}\n")
+          PY
+
+  # ------------------------------------------------------------------ 2) render (one runner per output)
+  render:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PART: ${{ inputs.part }}
+      SYNC: ${{ inputs.sync_mode }}
+      FRAMES: ${{ inputs.still_frames }}
+      INTRO: ${{ inputs.intro }}
+      OUTRO: ${{ inputs.outro }}
+      THUMB_TITLE: ${{ inputs.thumb_title }}
+      THUMB_SUBTITLE: ${{ inputs.thumb_subtitle }}
+      LABEL: ${{ matrix.label }}
+      COMP: ${{ matrix.comp }}
+      SCALE: ${{ matrix.scale }}
+      KIND: ${{ matrix.kind }}
+      DEBUG: ${{ matrix.debug }}
+    steps:
+      # ref = branch name, so the files pushed by the "prepare" job (unpacked update.zip) are included
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # npm cache needs a lockfile; enabled automatically once package-lock.json exists in the repo
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build data and audio (Python)
+        run: |
+          set -euo pipefail
+          INTRO_F=60; [ "$INTRO" = "true" ] || INTRO_F=0
+          OUTRO_F=90; [ "$OUTRO" = "true" ] || OUTRO_F=0
+          echo "::group::build_data.py (intro=$INTRO_F outro=$OUTRO_F sync=$SYNC)"
+          python build_data.py --part "$PART" --sync "$SYNC" --intro "$INTRO_F" --outro "$OUTRO_F"
+          echo "::endgroup::"
+          if [ -f make_ambience.py ]; then
+            echo "::group::make_ambience.py"
+            python -m pip install --quiet numpy || true
+            python make_ambience.py --part "$PART"
+            echo "::endgroup::"
+          else
+            echo "make_ambience.py does not exist yet - skipped"
+          fi
+          # fixed name used by Story v2 (Step 34); also needed for stills/thumbnails because the bundle imports it
+          cp "$PART.wav" narration.wav
+
+      - name: Install Chrome Headless Shell libraries (Ubuntu 24.04)
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y \
+                libnss3 libdbus-1-3 libatk1.0-0 libasound2t64 libxrandr2 libxkbcommon-dev \
+                libxfixes3 libxcomposite1 libxdamage1 libgbm-dev libcups2 libcairo2 \
+                libpango-1.0-0 libatk-bridge2.0-0; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $attempt failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
+
+      - name: npm install + Chrome (3 attempts)
+        run: |
+          set -uo pipefail
+          retry() {
+            local n=1 max=3 delay=15 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::failed after $n attempts: $*"; return "$rc"; fi
+              echo "::warning::attempt $n failed (exit $rc) - retrying in ${delay}s: $*"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+          retry npm install --no-audit --no-fund || exit 1
+          retry npx remotion browser ensure || exit 1
+
+      - name: Render
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          START=$SECONDS
+
+          # props are built with json.dumps, so Bengali text and quotes are always escaped correctly
+          PROPS=$(python3 - <<'PY'
+          import json, os
+          e = os.environ
+          if e["KIND"] == "thumb":
+              p = {"part": e["PART"], "title": e.get("THUMB_TITLE", ""), "subtitle": e.get("THUMB_SUBTITLE", "")}
+          else:
+              p = {"part": e["PART"], "debug": e["DEBUG"] == "true",
+                   "intro": e["INTRO"] == "true", "outro": e["OUTRO"] == "true"}
+          print(json.dumps(p, ensure_ascii=False, separators=(",", ":")))
+          PY
+          )
+          echo "composition: $COMP   kind: $KIND   scale: $SCALE"
+          echo "props: $PROPS"
+
+          # run a command up to 3 times; $RETRY_CLEAN (a file) is deleted before every retry
+          retry() {
+            local n=1 max=3 delay=20 rc
+            until "$@"; do
+              rc=$?
+              if [ "$n" -ge "$max" ]; then echo "::error::render failed after $n attempts: $COMP ($LABEL)"; return "$rc"; fi
+              echo "::warning::render attempt $n failed (exit $rc) - retrying in ${delay}s"
+              [ -n "${RETRY_CLEAN:-}" ] && rm -f "$RETRY_CLEAN"
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+
+          case "$KIND" in
+            video)
+              echo "::group::remotion render $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=18 --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            draft)
+              echo "::group::remotion render (draft) $COMP -> $PART-$LABEL.mp4"
+              RETRY_CLEAN="out/$PART-$LABEL.mp4" retry npx remotion render index.js "$COMP" "out/$PART-$LABEL.mp4" \
+                --scale="$SCALE" --crf=28 --x264-preset=ultrafast --codec=h264 --pixel-format=yuv420p \
+                --concurrency=2 --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            still)
+              TOTAL=$(python3 -c "import json; print(json.load(open('story_data.json'))['totalFrames'])")
+              echo "video has $TOTAL frames (valid still frames: 0..$((TOTAL - 1)))"
+              IFS=',' read -ra FR <<< "$FRAMES"
+              made=0
+              for f in "${FR[@]}"; do
+                f="$(echo "$f" | tr -d '[:space:]')"
+                [ -n "$f" ] || continue
+                if [ "$f" -ge "$TOTAL" ]; then
+                  echo "::warning::frame $f is outside 0..$((TOTAL - 1)) - skipped"
+                  continue
+                fi
+                OUT="out/$PART-$LABEL-f$(printf '%04d' "$f").png"
+                echo "::group::still frame $f -> $OUT"
+                RETRY_CLEAN="$OUT" retry npx remotion still index.js "$COMP" "$OUT" \
+                  --frame="$f" --scale="$SCALE" --props="$PROPS" || exit 1
+                echo "::endgroup::"
+                made=$((made + 1))
+              done
+              [ "$made" -gt 0 ] || { echo "::error::no valid still frames to render"; exit 1; }
+              ;;
+            thumb)
+              OUT="out/$PART-$LABEL.png"
+              echo "::group::thumbnail $COMP -> $OUT"
+              RETRY_CLEAN="$OUT" retry npx remotion still index.js "$COMP" "$OUT" \
+                --scale="$SCALE" --props="$PROPS" || exit 1
+              echo "::endgroup::"
+              ;;
+            *)
+              echo "::error::unknown kind $KIND"; exit 1
+              ;;
+          esac
+
+          ELAPSED=$((SECONDS - START))
+          echo "::group::output files"
+          ls -lh out
+          echo "::endgroup::"
+          {
+            echo "### Render \`$LABEL\` ($COMP, scale $SCALE) - ${ELAPSED}s"
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.part }}-${{ matrix.label }}
+          path: out/*
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ 3) optional GitHub Release
+  release:
+    needs: [prepare, render]
+    if: ${{ inputs.publish_release && inputs.mode != 'still' && needs.render.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.rel.outputs.url }}
+    env:
+      PART: ${{ inputs.part }}
+      MODE: ${{ inputs.mode }}
+      RUN: ${{ github.run_number }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated render of \`$PART\` (mode \`$MODE\`, run #$RUN)."
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+          } > release_notes.md
+          cat release_notes.md
+
+      - uses: softprops/action-gh-release@v2
+        id: rel
+        with:
+          tag_name: render-${{ inputs.part }}-${{ github.run_number }}
+          name: ${{ inputs.part }} ${{ inputs.mode }} #${{ github.run_number }}
+          target_commitish: ${{ github.ref_name }}
+          body_path: release_notes.md
+          prerelease: ${{ inputs.mode == 'draft' }}
+          files: out/*
+
+  # ------------------------------------------------------------------ 4) summary (runs even if something failed)
+  summary:
+    needs: [prepare, render, release]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PART: ${{ inputs.part }}
+      MODE: ${{ inputs.mode }}
+      ORIENTATION: ${{ inputs.orientation }}
+      QUALITY: ${{ inputs.quality }}
+      SYNC: ${{ inputs.sync_mode }}
+      INTRO: ${{ inputs.intro }}
+      OUTRO: ${{ inputs.outro }}
+      LABELS: ${{ needs.prepare.outputs.labels }}
+      RENDER_RESULT: ${{ needs.render.result }}
+      RELEASE_RESULT: ${{ needs.release.result }}
+      RELEASE_URL: ${{ needs.release.outputs.url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dl
+
+      - name: Job summary table
+        run: |
+          python3 - <<'PY'
+          import os
+          e = os.environ
+          labels = [x for x in e.get("LABELS", "").split(",") if x]
+          part = e["PART"]
+          rows, ok = [], 0
+          for lb in labels:
+              d = os.path.join("dl", f"{part}-{lb}")
+              files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+              if files:
+                  ok += 1
+                  size = sum(os.path.getsize(os.path.join(d, f)) for f in files)
+                  rows.append(f"| `{lb}` | OK | {len(files)} | {size / 1048576:.1f} MB |")
+              else:
+                  rows.append(f"| `{lb}` | MISSING (render failed - open the job log) | 0 | - |")
+          out = []
+          out.append(f"## Render summary - `{part}`")
+          out.append("")
+          out.append(f"- Mode: **{e['MODE']}** | orientation: {e['ORIENTATION']} | quality: {e['QUALITY']} | sync: `{e['SYNC']}`")
+          out.append(f"- Intro: {e['INTRO']} | outro: {e['OUTRO']}")
+          out.append(f"- Render job: **{e['RENDER_RESULT']}** | outputs ready: **{ok}/{len(labels)}**")
+          if e.get("RELEASE_RESULT") and e["RELEASE_RESULT"] != "skipped":
+              url = e.get("RELEASE_URL", "")
+              out.append(f"- Release: **{e['RELEASE_RESULT']}**" + (f" - {url}" if url else ""))
+          out.append(f"- Download the files from the **Artifacts** section at the bottom of this run page: {e['RUN_URL']}")
+          out.append("")
+          out.append("| Output | Status | Files | Size |")
+          out.append("|---|---|---|---|")
+          out.extend(rows)
+          out.append("")
+          if ok < len(labels):
+              out.append("> If a row says MISSING: open that render job, copy the red error lines and send them to the AI (one file will be fixed).")
+          text = "\n".join(out) + "\n"
+          print(text)
+          with open(e["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(text)
+          PY
